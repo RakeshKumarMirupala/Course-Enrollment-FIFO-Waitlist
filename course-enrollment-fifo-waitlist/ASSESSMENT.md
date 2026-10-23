@@ -76,6 +76,7 @@ drop(offeringId, learnerId):
 - Runtime datastore: **PostgreSQL** (`org.postgresql:postgresql`), via Spring Data JPA/Hibernate.
 - Every `enroll`/`drop` transaction starts by acquiring `SELECT ... FOR UPDATE` on the `CourseOffering` row (`CourseOfferingRepository.lockById`, `@Lock(PESSIMISTIC_WRITE)`). This serializes all capacity checks, enrollments, waitlist inserts, and promotion scans **for that offering** across concurrent transactions, so two concurrent `enroll` calls cannot both observe a free seat and overbook it, and a `drop` cannot race a concurrent `enroll` past capacity.
 - The unique constraints on `(offering_id, learner_id)` are a second line of defense against duplicate rows even if application-level checks were ever bypassed.
+- **Verified with a focused concurrency test** (`EnrollmentConcurrencyTest`): 8 threads enroll concurrently into a 1-seat offering; the final state always has exactly 1 enrollment and 7 waitlist entries, with no overbooking or duplicate rows.
 - **Trade-off:** locking is per-offering, not global, so unrelated offerings are never blocked by each other; but all operations on one offering are fully serialized (acceptable for a single bounded course-registration feature; not designed for very high-throughput single-offering traffic).
 - Tests run against an in-memory **H2** database (`src/test/resources/application.properties`) instead of Postgres, for fast, deterministic, dependency-free test runs. This is a documented trade-off (see Limitations) — H2 supports standard SQL locking/constraints used here, but is not byte-for-byte identical to Postgres.
 
@@ -93,12 +94,12 @@ drop(offeringId, learnerId):
 
 **Prerequisites**
 - JDK 17+ on `PATH` or `JAVA_HOME` (verified with JDK 21 at `C:\softwares\Java\jdk-21`; Maven itself is not required — use the bundled `mvnw`/`mvnw.cmd`).
-- PostgreSQL reachable at `localhost:5432`, user `postgres` (password via `DB_PASSWORD` env var, defaults to the value used in dev). **Create the database once before running the app** (tests do not need it):
+- PostgreSQL reachable at `localhost:5432`, user `postgres`. The password is **not** hardcoded anywhere in the repo — set it via an environment variable before running the app. **Create the database once before running the app** (tests do not need it):
   ```sql
   CREATE DATABASE course_enrollment;
   ```
 
-**Build & test (uses H2, no Postgres required):**
+**Build & test (uses H2, no Postgres required, no credentials needed):**
 ```powershell
 $env:JAVA_HOME = "C:\softwares\Java\jdk-21"
 $env:Path = "$env:JAVA_HOME\bin;" + $env:Path
@@ -107,6 +108,7 @@ $env:Path = "$env:JAVA_HOME\bin;" + $env:Path
 
 **Run the app (requires Postgres):**
 ```powershell
+$env:DB_PASSWORD = "<your-postgres-password>"
 .\mvnw.cmd spring-boot:run
 ```
 
@@ -114,16 +116,19 @@ $env:Path = "$env:JAVA_HOME\bin;" + $env:Path
 ```
 Tests run: 1, Failures: 0, Errors: 0  -- CourseEnrollmentFifoWaitlistApplicationTests
 Tests run: 10, Failures: 0, Errors: 0 -- EnrollmentServiceTest
+Tests run: 1, Failures: 0, Errors: 0  -- EnrollmentConcurrencyTest
 Tests run: 5, Failures: 0, Errors: 0  -- EnrollmentApiTest
 mvnw package -DskipTests -> BUILD SUCCESS, jar produced at target/course-enrollment-fifo-waitlist-0.0.1-SNAPSHOT.jar
 ```
+
+Manual end-to-end verification was also performed against the running app on port 8080 with a real PostgreSQL instance, exercising every scenario in the table below via HTTP requests (see session record); all responses matched the documented policy.
 
 ## Limitations and follow-up risks
 
 - Tests run against H2, not Postgres — core SQL semantics (locking, unique constraints) are exercised, but Postgres-specific behavior is not separately verified. Running `mvnw test -Dspring.datasource.url=jdbc:postgresql://...` against a real Postgres instance was not executed in this session.
 - No dedicated multi-threaded concurrency test (e.g., parallel `enroll` calls hammering one offering) was written; correctness under concurrency relies on the `SELECT ... FOR UPDATE` row lock, which is a standard, well-understood pattern but is unverified by an automated concurrent test here.
 - `ddl-auto=update` is used for convenience in this bounded exercise; a production system would use versioned migrations (e.g., Flyway/Liquibase) instead.
-- The `DB_PASSWORD` default in `application.properties` is a local-dev convenience given the credentials supplied for this exercise; it must not be committed/used as-is outside local development.
+- **Security remediation applied during final review:** an earlier commit of `application.properties` contained a hardcoded default database password (`DB_PASSWORD:Rakesh@123`). This was removed — the property now has no default and must be supplied via the `DB_PASSWORD` environment variable, so the app fails fast if it's unset rather than silently using a weak default. Because the earlier value was already pushed to the remote, **the exposed password should be rotated** on the Postgres instance; this plaintext-credential-in-history risk is disclosed here rather than silently fixed.
 
 ## Acceptance-criteria traceability
 
@@ -140,5 +145,6 @@ mvnw package -DskipTests -> BUILD SUCCESS, jar produced at target/course-enrollm
 | 10 | Invalid requests return clear results, no corruption | Bean Validation + `GlobalExceptionHandler` | `createOffering_rejectsNonPositiveCapacity`, `enroll_rejectsBlankLearnerId` | Pass |
 | 11 | Drop of non-enrolled learner handled | `EnrollmentService.drop` → `NotEnrolledException` | `drop_rejectsLearnerWhoIsNotEnrolled`, `drop_returnsNotFoundWhenLearnerNotEnrolled` | Pass |
 | 12/13 | Repeated drops safe, counts consistent | `EnrollmentService.drop` | `drop_repeatedDropDoesNotCorruptCapacityOrWaitlistState` | Pass |
+| — | Concurrent enroll requests never overbook capacity | `EnrollmentService.enroll` pessimistic lock | `EnrollmentConcurrencyTest.concurrentEnrollRequestsNeverExceedCapacity` | Pass |
 
-All 16 automated tests passed in this session (`mvnw test`, JDK 21).
+All 17 automated tests passed in this session (`mvnw test`, JDK 21).
